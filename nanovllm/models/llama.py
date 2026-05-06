@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 import torch.distributed as dist
-from transformers import Qwen3Config
+from transformers import LlamaConfig
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
@@ -11,16 +11,28 @@ from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
-class Qwen3Attention(nn.Module):
+def parse_rope_scaling(rope_scaling: dict | None) -> dict:
+    if not isinstance(rope_scaling, dict):
+        return {}
+    rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+    return dict(
+        rope_type=rope_type,
+        scaling_factor=float(rope_scaling.get("factor", 1.0)),
+        low_freq_factor=float(rope_scaling.get("low_freq_factor", 1.0)),
+        high_freq_factor=float(rope_scaling.get("high_freq_factor", 1.0)),
+        original_max_position_embeddings=rope_scaling.get("original_max_position_embeddings"),
+    )
+
+
+class LlamaAttention(nn.Module):
 
     def __init__(
         self,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        max_position: int = 4096 * 32,
+        max_position: int = 4096,
         head_dim: int | None = None,
-        rms_norm_eps: float = 1e-06,
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: dict | None = None,
@@ -37,7 +49,6 @@ class Qwen3Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
-        self.qkv_bias = qkv_bias
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -51,6 +62,7 @@ class Qwen3Attention(nn.Module):
             hidden_size,
             bias=False,
         )
+        rope_scaling_kwargs = parse_rope_scaling(rope_scaling)
         if isinstance(rope_scaling, dict):
             rope_theta = rope_scaling.get("rope_theta", rope_theta)
         self.rotary_emb = get_rope(
@@ -58,6 +70,7 @@ class Qwen3Attention(nn.Module):
             rotary_dim=self.head_dim,
             max_position=max_position,
             base=rope_theta,
+            **rope_scaling_kwargs,
         )
         self.attn = Attention(
             self.num_heads,
@@ -65,9 +78,6 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
         )
-        if not self.qkv_bias:
-            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -79,16 +89,13 @@ class Qwen3Attention(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        if not self.qkv_bias:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
         output = self.o_proj(o.flatten(1, -1))
         return output
 
 
-class Qwen3MLP(nn.Module):
+class LlamaMLP(nn.Module):
 
     def __init__(
         self,
@@ -117,26 +124,24 @@ class Qwen3MLP(nn.Module):
         return x
 
 
-class Qwen3DecoderLayer(nn.Module):
+class LlamaDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config,
+        config: LlamaConfig,
     ) -> None:
         super().__init__()
-        # self_attn
-        self.self_attn = Qwen3Attention(
+        self.self_attn = LlamaAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
-            rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, 'attention_bias', True),
-            head_dim=getattr(config, 'head_dim', None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
+            head_dim=getattr(config, "head_dim", None),
+            qkv_bias=getattr(config, "attention_bias", False),
+            rope_theta=getattr(config, "rope_theta", 10000),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
-        self.mlp = Qwen3MLP(
+        self.mlp = LlamaMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -160,17 +165,15 @@ class Qwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Qwen3Model(nn.Module):
+class LlamaModel(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config,
+        config: LlamaConfig,
     ) -> None:
         super().__init__()
-        # 输入 token id -> hidden states 的词嵌入层，且按 vocab 维做并行切分（TP 友好）。
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        # 堆叠num_hidden_layer隐藏层
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -186,7 +189,7 @@ class Qwen3Model(nn.Module):
         return hidden_states
 
 
-class Qwen3ForCausalLM(nn.Module):
+class LlamaForCausalLM(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -197,12 +200,10 @@ class Qwen3ForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config
+        config: LlamaConfig
     ) -> None:
         super().__init__()
-        # 函数重载
-        self.model = Qwen3Model(config)
-        # 函数重载
+        self.model = LlamaModel(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data

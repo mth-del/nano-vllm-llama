@@ -43,6 +43,10 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+## Optimization Tracking
+
+See `OPTIMIZATION_LOG.md` for a running history of optimization changes.
+
 ## Benchmark
 
 See `bench.py` for benchmark.

@@ -6,10 +6,19 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.models.llama import LlamaForCausalLM
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+
+
+def get_model_cls(model_type: str):
+    if model_type == "qwen3":
+        return Qwen3ForCausalLM
+    if model_type == "llama":
+        return LlamaForCausalLM
+    raise NotImplementedError(f"Unsupported model_type: {model_type}")
 
 
 class ModelRunner:
@@ -28,17 +37,21 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        model_cls = get_model_cls(hf_config.model_type)
+        self.model = model_cls(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        # 预热推理器
         self.warmup_model()
+        # 分配KV cache
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
-
+        # multiprocessing
         if self.world_size > 1:
+            # 主进程
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
                 dist.barrier()
@@ -61,6 +74,7 @@ class ModelRunner:
     def loop(self):
         while True:
             method_name, args = self.read_shm()
+            # 回调函数
             self.call(method_name, *args)
             if method_name == "exit":
                 break
@@ -79,12 +93,14 @@ class ModelRunner:
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
+        # 设置事件
         for event in self.event:
             event.set()
 
     def call(self, method_name, *args):
         if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
+        # 按字符串拿到实例的方法
         method = getattr(self, method_name, None)
         return method(*args)
 
@@ -105,10 +121,14 @@ class ModelRunner:
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
+        # 拿到cuda内存的峰值和当前值
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        # self.world_size ： 并行的卡数
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        # kv_heads的维度
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        # block需要分配的内存
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0

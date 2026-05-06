@@ -39,7 +39,9 @@ class Scheduler:
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             if seq.num_scheduled_tokens == num_tokens:
                 seq.status = SequenceStatus.RUNNING
+                # 把请求从等待队列移除
                 self.waiting.popleft()
+                # 加到运行队列中
                 self.running.append(seq)
             scheduled_seqs.append(seq)
             num_batched_tokens += seq.num_scheduled_tokens
@@ -50,6 +52,7 @@ class Scheduler:
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
+                # 抢占式
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
