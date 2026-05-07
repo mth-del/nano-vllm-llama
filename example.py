@@ -1,9 +1,16 @@
 import os
+import sys
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
+MODELS = {
+    "qwen":  ("Qwen3-0.6B",              "~/huggingface/Qwen3-0.6B/"),
+    "llama": ("Llama-3.2-1B-Instruct",   "~/huggingface/Llama-3.2-1B-Instruct/"),
+}
+
 
 def run_example(name: str, path: str, prompts: list[str]):
+    path = os.path.expanduser(path)
     if not os.path.isdir(path):
         print(f"[Skip] {name}: model path not found: {path}")
         return
@@ -20,6 +27,7 @@ def run_example(name: str, path: str, prompts: list[str]):
         for prompt in prompts
     ]
     outputs = llm.generate(model_inputs, sampling_params)
+    llm.exit()
 
     for prompt, output in zip(prompts, outputs):
         print("\n")
@@ -32,10 +40,15 @@ def main():
         "请你做个自我介绍。",
         "请列出 100 以内所有质数。",
     ]
-    qwen_path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    llama_path = os.path.expanduser("~/huggingface/Llama-3.2-3B-Instruct/")
-    run_example("Qwen3-0.6B", qwen_path, prompts)
-    run_example("Llama-3.2-3B-Instruct", llama_path, prompts)
+    # 用法: python3 example.py [qwen|llama]
+    # 不加参数默认跑 qwen（单 GPU 显存不够同时跑两个大模型）
+    keys = sys.argv[1:] or ["qwen"]
+    for key in keys:
+        if key not in MODELS:
+            print(f"[Error] 未知模型: {key}，可选: {list(MODELS)}")
+            continue
+        name, path = MODELS[key]
+        run_example(name, path, prompts)
 
 
 if __name__ == "__main__":
