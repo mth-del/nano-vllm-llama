@@ -1,0 +1,9 @@
+1. NVIDIA Nsight Systems（系统级 GPU timeline）
+# 采集 profile
+nsys profile \
+  --trace=cuda,nvtx,osrt \
+  --output=llama_profile \
+  python3 example.py llama
+
+# 查看（GUI）
+nsys-ui llama_profile.nsys-rep

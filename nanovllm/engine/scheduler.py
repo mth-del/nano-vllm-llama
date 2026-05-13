@@ -25,7 +25,7 @@ class Scheduler:
         scheduled_seqs = []
         num_batched_tokens = 0
 
-        # prefill
+        ## [1]prefill
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
             num_tokens = max(seq.num_tokens - seq.num_cached_tokens, 1)
@@ -38,17 +38,18 @@ class Scheduler:
                 self.block_manager.allocate(seq)
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             if seq.num_scheduled_tokens == num_tokens:
+                # [1]设置当前sequenceStatus状态
                 seq.status = SequenceStatus.RUNNING
-                # 把请求从等待队列移除
+                # [1]把请求从等待队列移除
                 self.waiting.popleft()
-                # 加到运行队列中
+                # [2]加到运行队列中
                 self.running.append(seq)
             scheduled_seqs.append(seq)
             num_batched_tokens += seq.num_scheduled_tokens
         if scheduled_seqs:
             return scheduled_seqs, True
 
-        # decode
+        ##  [2]decode
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):

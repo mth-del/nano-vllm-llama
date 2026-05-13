@@ -15,7 +15,9 @@ def run_example(name: str, path: str, prompts: list[str]):
         print(f"[Skip] {name}: model path not found: {path}")
         return
     print(f"\n===== {name} =====")
+    # [0] 加载分词器
     tokenizer = AutoTokenizer.from_pretrained(path)
+    # [1] LLMEngine创建
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     model_inputs = [
@@ -26,6 +28,7 @@ def run_example(name: str, path: str, prompts: list[str]):
         )
         for prompt in prompts
     ]
+    # [2]推理输出
     outputs = llm.generate(model_inputs, sampling_params)
     llm.exit()
 

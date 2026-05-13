@@ -31,31 +31,34 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-
+        # [0] 初始化Nccl GPU之间通信的库
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
+        # [1] 选择模型
         model_cls = get_model_cls(hf_config.model_type)
         self.model = model_cls(hf_config)
+        # [0] 下载模型
         load_model(self.model, config.model)
         self.sampler = Sampler()
-        # 预热推理器
+        ####  [1]预热推理器
         self.warmup_model()
-        # 分配KV cache
+        ####  [2]分配KV cache
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
-        # multiprocessing
+        #### [3]multiprocessing设置并行数
         if self.world_size > 1:
             # 主进程
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
                 dist.barrier()
             else:
+                # 等ranK0创建完成
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
@@ -81,8 +84,10 @@ class ModelRunner:
 
     def read_shm(self):
         assert self.world_size > 1 and self.rank > 0
+        # [0] 阻塞rank0直到write_shem
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
+        # [1] 解析方法和参数列表
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
         self.event.clear()
         return method_name, args
@@ -98,7 +103,9 @@ class ModelRunner:
             event.set()
 
     def call(self, method_name, *args):
+        # [0] 并行大于2，主线程
         if self.world_size > 1 and self.rank == 0:
+            # [1] 写入smem
             self.write_shm(method_name, *args)
         # 按字符串拿到实例的方法
         method = getattr(self, method_name, None)
@@ -121,15 +128,16 @@ class ModelRunner:
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
-        # 拿到cuda内存的峰值和当前值
+        # [1]拿到cuda内存的峰值和当前值
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        # self.world_size ： 并行的卡数
+        # [2]self.world_size ： 并行的卡数
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        # kv_heads的维度
+        # [3]kv_heads的维度
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        # block需要分配的内存
+        # [4]block需要分配的内存
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        # [5]可以分配的block数
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
@@ -244,18 +252,21 @@ class ModelRunner:
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
+        # [1] 定义最大batch和静态buffer
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        # [2]在当前CUDA设备分配一整块最大规格占位tensor
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        # [3]选择batch_size各录一张图
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
-
+        # [4]从大到小进行录制
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
@@ -263,7 +274,9 @@ class ModelRunner:
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
             if self.graph_pool is None:
+                # 图池
                 self.graph_pool = graph.pool()
+            # 按索引存图
             self.graphs[bs] = graph
             torch.cuda.synchronize()
             reset_context()

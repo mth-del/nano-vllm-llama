@@ -204,6 +204,7 @@ class LlamaForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.model = LlamaModel(config)
+        # 多头
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data

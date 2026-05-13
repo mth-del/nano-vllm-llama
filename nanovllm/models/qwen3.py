@@ -38,7 +38,7 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
-
+        # [0] QKV线性层
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -46,11 +46,13 @@ class Qwen3Attention(nn.Module):
             self.total_num_kv_heads,
             bias=qkv_bias,
         )
+        # [1] 输出
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
         )
+        # [2] 旋转位置编码
         if isinstance(rope_scaling, dict):
             rope_theta = rope_scaling.get("rope_theta", rope_theta)
         self.rotary_emb = get_rope(
