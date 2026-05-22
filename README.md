@@ -37,6 +37,8 @@ See `example.py` for usage. The API mirrors vLLM's interface with minor differen
 ```python
 from nanovllm import LLM, SamplingParams
 llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
+# Optional: CPU prefill + GPU decode (see OPTIMIZATION_LOG.md)
+# llm = LLM("/YOUR/MODEL/PATH", pd_separation=True, enforce_eager=True, tensor_parallel_size=1)
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
 prompts = ["Hello, Nano-vLLM."]
 outputs = llm.generate(prompts, sampling_params)
@@ -68,3 +70,8 @@ See `bench.py` for benchmark.
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
+
+
+下载MATH500
+export HF_ENDPOINT=https://hf-mirror.com
+hf download HuggingFaceH4/MATH-500 --repo-type dataset --local-dir ~/huggingface/MATH-500

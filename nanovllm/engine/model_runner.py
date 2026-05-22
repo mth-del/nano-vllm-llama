@@ -11,6 +11,7 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.engine.kv_transfer import import_kv_to_gpu
 
 
 def get_model_cls(model_type: str):
@@ -166,9 +167,11 @@ class ModelRunner:
         for seq in seqs:
             seqlen = len(seq)
             start = min(seq.num_cached_tokens, seqlen - 1)
-            seqlen_q = seq.num_scheduled_tokens
+            end = min(start + seq.num_scheduled_tokens, seqlen)
+            seqlen_q = end - start
+            if seqlen_q == 0:
+                continue
             seqlen_k = seqlen
-            end = start + seqlen_q
             input_ids.extend(seq[start:end])
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
@@ -178,7 +181,7 @@ class ModelRunner:
             if not seq.block_table:    # warmup
                 continue
             start_block = start // self.block_size
-            end_block = (end + self.block_size - 1) // self.block_size
+            end_block = min((end + self.block_size - 1) // self.block_size, len(seq.block_table))
             for i in range(start_block, end_block):
                 slot_start = seq.block_table[i] * self.block_size
                 if i == start_block:
@@ -199,21 +202,62 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        config = self.config
         input_ids = []
         positions = []
         slot_mapping = []
         context_lens = []
         for seq in seqs:
             input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
+            positions.append(seq.rope_pos)
+            context_lens.append(seq.num_tokens)
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+
+        compress_selected = []
+        compress_base = None
+        trigger_len = 0
+        if config.kv_compress:
+            B = self.block_size
+            compress_base = context_lens.clone()
+            period = config.kv_compress_period
+            if period > 0:
+                trigger_len = period
+                for i, seq in enumerate(seqs):
+                    clen = seq.num_tokens
+                    anchor = getattr(seq, "kv_compress_anchor", 0)
+                    if clen >= period and clen - anchor >= period:
+                        if clen // B >= period // B:
+                            compress_selected.append(i)
+            else:
+                N = config.kv_compress_n
+                trigger_len = B * (N + 1) - 1
+                for i, clen in enumerate(context_lens.tolist()):
+                    if clen == trigger_len:
+                        full_blocks = clen // B
+                        if full_blocks >= N + 1:
+                            compress_selected.append(i)
+
+        set_context(
+            False,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            kv_compress_enabled=config.kv_compress,
+            kv_compress_trigger_len=trigger_len,
+            kv_compress_n=config.kv_compress_n,
+            kv_compress_snap_window=config.kv_compress_snap_window,
+            kv_compress_period=config.kv_compress_period,
+            kv_compress_ratio=config.kv_compress_ratio,
+            kvcache_block_size=self.block_size,
+            compress_selected_batch_indices=compress_selected,
+            compress_base_context_lens=compress_base,
+            num_hidden_layers=config.hf_config.num_hidden_layers,
+        )
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -240,13 +284,24 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    @torch.inference_mode()
+    def import_kv(self, seq: Sequence, cpu_kv_layers: list[tuple[torch.Tensor, torch.Tensor]]):
+        hf_config = self.config.hf_config
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        import_kv_to_gpu(self.kv_cache, cpu_kv_layers, seq, self.block_size, num_kv_heads, head_dim)
+        torch.cuda.synchronize()
+
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> tuple[list[int] | None, list | None]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        ctx = get_context()
+        # KV_Cache compression Envent
+        compression_events = None if is_prefill else ctx.compression_events
         reset_context()
-        return token_ids
+        return token_ids, compression_events
 
     @torch.inference_mode()
     def capture_cudagraph(self):

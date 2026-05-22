@@ -24,6 +24,110 @@ Track every optimization change in this file.
 
 ---
 
+## [2026-05-17] CPU Prefill / GPU Decode 分离（pd_separation）
+
+### Phase 1 — 控制面与状态机
+- Scope: `config`, `scheduler`, `sequence` 调度路径
+- Change:
+  - `Config.pd_separation: bool = False`（要求 `tensor_parallel_size=1`）
+  - `Scheduler.schedule_cpu_prefill()`：为 waiting 序列在 GPU 上 `allocate` block，移入 `running`
+  - `Scheduler.schedule()` 在 PD 模式下 **跳过 GPU prefill**，仅 decode
+- Why: 将 Prefill 与 Decode 在调度层解耦，为跨设备执行做准备
+- Validation: `python -m compileall nanovllm` 通过
+- Notes: 默认关闭，不影响现有单卡路径
+
+### Phase 2 — CPU Prefill + KV handoff
+- Scope: `cpu_prefill_runner`, `kv_transfer`, `attention`, `model_runner.import_kv`
+- Change:
+  - 新增 `CPUPrefillRunner`：CPU 上加载同结构模型，用 `cpu_prefill_capture` + `scaled_dot_product_attention` 跑 prompt
+  - 每层捕获 `(K,V)`，经 `import_kv_to_gpu()` 按 `block_table`/`slot_mapping` 写入 GPU `kv_cache`
+  - `ModelRunner.import_kv()` 封装 H2D `index_copy_`
+  - `Attention` 增加 `_cpu_prefill_attention`；`context` 增加 `cpu_prefill_capture` / `kv_captures`
+  - 修复 `get_rope()` 全局 `lru_cache` 导致 CPU/GPU 共享 RoPE buffer 的设备冲突；RoPE `cos_sin` 按 `query.device` 对齐
+- Why: Prefill 算力放 CPU，GPU 显存主要用于 Decode KV 与高 batch decode
+- Validation: PD 路径单请求可跑通（Qwen3-0.6B）
+- Notes: PD 模式会在 Host 再加载一份 CPU 权重，系统 RAM 占用上升
+
+### Phase 4 — 延迟 GPU KV 分配（waiting 不占 GPU block）
+
+- Scope: `scheduler`, `sequence`, `llm_engine._step_pd`
+- Change:
+  - 三队列：`waiting` →（CPU prefill）→ `prefill_ready`（host KV，`cpu_kv_layers` + 可选 `pin_memory`）→（`allocate` + `import_kv`）→ `running`（仅 decode 占 GPU block）
+  - `schedule_cpu_prefill()` 不再 `block_manager.allocate`
+  - 新增 `schedule_gpu_handoff()`：仅当 `can_allocate` 成功才占 GPU KV
+  - `Sequence.cpu_kv_layers` 保存 handoff 前 KV；handoff 后置 `None` 释放 host
+  - `is_finished` 包含 `prefill_ready` 非空
+- Why: 在 GPU KV 紧张时，让大量未完成 handoff 的请求只占用 **CPU 内存**，把 **有限 GPU block** 留给正在 decode 的序列
+- Validation: `validate_pd_separation.py` 仍 **token 完全一致**
+- Notes: `prefill_ready` 积压会升高 **Host RAM**；可用 `scripts/stress_kv_capacity.py` 压测
+
+```bash
+python scripts/stress_kv_capacity.py ~/huggingface/Qwen3-0.6B/ \
+  --num-reqs 16 --prompt-tokens 1024 --max-tokens 128 --gpu-util 0.55
+```
+
+### Phase 3 — LLMEngine 集成与首 token 对齐
+- Scope: `llm_engine._step_pd`
+- Change:
+  - 每步优先 `schedule_cpu_prefill` → CPU prefill → `import_kv` → **同一 step 内 GPU decode** 采首 token
+  - 首 token 在 GPU 上采样（与 baseline 一致），避免 CPU/GPU 数值差导致分叉
+  - 后续 step 走常规 `schedule()` decode
+- Why: 保证与 unified GPU 路径输出一致，仅 Prefill 计算换设备
+- Validation: 见下方端到端对比
+
+### 性能对比 baseline vs PD（Qwen3-0.6B，单卡，enforce_eager）
+
+命令（建议分场景或一次跑全）：
+
+```bash
+python scripts/benchmark_pd.py ~/huggingface/Qwen3-0.6B/ --cases short,prompt512,prompt2k
+# 或单独：--cases prompt512
+```
+
+环境：本地 RTX GPU；`max_tokens=256`（prompt512 / prompt2k）；短场景 `max_tokens=64`。
+
+| 场景 | prompt | out | TTFT baseline | TTFT PD | TTFT 倍率 | TPOT baseline | TPOT PD | e2e baseline | e2e PD |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| short | ~54 | 64 | 24 ms | 275 ms | **11.6×** | 19.5 ms | 20.1 ms | 51.0 tok/s | 41.5 tok/s |
+| prompt512 | 514 | 256 | 32 ms | 2361 ms | **74.4×** | 19.8 ms | 20.0 ms | 50.3 tok/s | 34.3 tok/s |
+| prompt2k | 2078 | 256 | 144 ms | 9954 ms | **69.1×** | 19.0 ms | 19.6 ms | 51.4 tok/s | 17.1 tok/s |
+
+**结论**：
+- **TTFT**：PD 随 prompt 变长急剧恶化（2k prompt 时 CPU prefill + KV H2D ≈ **10s** vs GPU **144ms**）。瓶颈在 **CPU 算子（SDPA）+ 跨设备 KV 拷贝**，不是 decode。
+- **TPOT**：三种场景下几乎相同（~19–20ms/token），与「decode 仍走同一 GPU 路径」一致。
+- **端到端**：输出 256 token 时，prompt 越长 PD 相对越亏（2k 场景 e2e 仅 baseline 的 **33%**）；短输出时 PD 约慢 **18–32%**。
+
+**说明**：
+- 长 prompt 未做 CPU chunked prefill；`import_kv` 一次性 H2D 全部层 KV。
+- 多场景同进程跑可能触发 prefix-cache 边界问题；长 prompt 场景已默认 **跳过 in-LLM warmup**，建议分 `--cases` 跑或一次只测一个场景。
+- `prepare_prefill` 已加 `end_block` 与 `block_table` 长度对齐，避免极端 chunked 下标越界。
+
+### 端到端正确性验证（Qwen3-0.6B，prompt 一句话，max_tokens=16，seed=42）
+
+```bash
+python scripts/validate_pd_separation.py ~/huggingface/Qwen3-0.6B/
+```
+
+| 指标 | 结果 |
+|---|---|
+| baseline vs `pd_separation=True` token_ids | **完全一致**（16/16） |
+| 命令退出码 | 0 |
+| 注意 | 两次运行间需 `gc` + `cuda.empty_cache()`；PD 建议 `gpu_memory_utilization=0.85`（CPU+GPU 双份权重） |
+
+### 使用方式
+
+```python
+llm = LLM(model_path, pd_separation=True, enforce_eager=True, tensor_parallel_size=1)
+```
+
+### 已知限制 / 后续
+- 未做 chunked CPU prefill、异步 H2D、多请求 PD 流水线
+- `tensor_parallel_size > 1` 未支持
+- 长 prompt（如 48k）需单独评估 CPU 时延与 KV 传输带宽
+- 可选：Phase 4 用 `ncu` 对比 PD 下 GPU SM 占用与 decode 吞吐
+
+---
+
 ## [2026-05-08] store_kvcache_kernel 多 token per block 优化
 
 ### 1. 遇到的问题

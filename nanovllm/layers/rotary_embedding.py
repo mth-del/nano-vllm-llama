@@ -1,4 +1,3 @@
-from functools import lru_cache
 import torch
 from torch import nn
 
@@ -58,21 +57,19 @@ class RotaryEmbedding(nn.Module):
         cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-    @torch.compile
     def forward(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cos_sin = self.cos_sin_cache[positions]
+        cos_sin = self.cos_sin_cache[positions].to(device=query.device, dtype=query.dtype)
         cos, sin = cos_sin.chunk(2, dim=-1)
         query = apply_rotary_emb(query, cos, sin)
         key = apply_rotary_emb(key, cos, sin)
         return query, key
 
 
-@lru_cache(maxsize=32)
 def get_rope(
     head_size: int,
     rotary_dim: int,

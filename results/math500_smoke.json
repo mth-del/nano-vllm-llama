@@ -1,0 +1,18 @@
+{
+  "baseline": {
+    "kv_compress": false,
+    "n": 20,
+    "correct": 0,
+    "accuracy": 0.0,
+    "elapsed_s": 7.956431194994366,
+    "tok_per_s": 643.5045907543508
+  },
+  "compress": {
+    "kv_compress": true,
+    "n": 20,
+    "correct": 4,
+    "accuracy": 0.2,
+    "elapsed_s": 5.801880010985769,
+    "tok_per_s": 882.4725761831269
+  }
+}
