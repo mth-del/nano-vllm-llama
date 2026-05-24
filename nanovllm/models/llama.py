@@ -9,6 +9,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.ops.gemm import fused_gate_up_silu
 from nanovllm.utils.context import get_context
 
 
@@ -119,8 +120,12 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        ctx = get_context()
+        if ctx.is_prefill:
+            x = fused_gate_up_silu(x, self.gate_up_proj.weight)
+        else:
+            gate_up = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
         x = self.down_proj(x)
         return x
 

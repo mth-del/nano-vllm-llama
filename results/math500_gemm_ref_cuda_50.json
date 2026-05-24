@@ -1,0 +1,42 @@
+{
+  "baseline/ref": {
+    "kv_compress": false,
+    "gemm_backend": "ref",
+    "kv_compress_period": 0,
+    "kv_compress_ratio": 0.5,
+    "n": 50,
+    "correct": 27,
+    "accuracy": 0.54,
+    "elapsed_s": 58.395926870405674,
+    "prefill_s": 1.0376254133880138,
+    "decode_s": 57.280208311975,
+    "prefill_tokens": 5806,
+    "decode_tokens": 21004,
+    "prefill_steps": 4,
+    "decode_steps": 2044,
+    "prefill_tok_s": 5595.468196025073,
+    "decode_tok_s": 366.68861058609144,
+    "tok_per_s": 360.53884454516475,
+    "compress_events": 0
+  },
+  "baseline/cuda": {
+    "kv_compress": false,
+    "gemm_backend": "cuda",
+    "kv_compress_period": 0,
+    "kv_compress_ratio": 0.5,
+    "n": 50,
+    "correct": 27,
+    "accuracy": 0.54,
+    "elapsed_s": 49.08948766440153,
+    "prefill_s": 0.22597878612577915,
+    "decode_s": 48.80235797725618,
+    "prefill_tokens": 5806,
+    "decode_tokens": 21863,
+    "prefill_steps": 4,
+    "decode_steps": 1784,
+    "prefill_tok_s": 25692.67717354848,
+    "decode_tok_s": 447.9906485295038,
+    "tok_per_s": 446.38885110815204,
+    "compress_events": 0
+  }
+}

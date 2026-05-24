@@ -24,6 +24,200 @@ Track every optimization change in this file.
 
 ---
 
+## [2026-05-24] Prefill MLP GEMM：CUDA 融合 epilogue + ops 目录 + MATH-500 评测
+
+- Scope: `nanovllm/ops/`, `nanovllm/ops/cuda/`, `nanovllm/ops/gemm.py`, `nanovllm/layers/linear.py`, `nanovllm/layers/embed_head.py`, `nanovllm/layers/attention.py`, `nanovllm/models/qwen3.py`, `nanovllm/models/llama.py`, `scripts/benchmark_gemm.py`, `scripts/eval_math500.py`, `scripts/run_math500_gemm.sh`
+- Change:
+  - 新增 **`nanovllm/ops/`** 算子优化目录：`gemm.py`（GEMM 调度）、`kv_cache.py`（自 `attention.py` 迁出 Triton KV 写入）
+  - **Prefill MLP 融合**：`gate_up_proj + SiluAndMul` → `fused_gate_up_silu()`
+    - **ref**：`F.linear` + Python `split` + `F.silu`
+    - **cuda**：cuBLAS `at::linear` + 自定义 CUDA `silu_mul_kernel`（`ops/cuda/fused_mlp.cu/.cpp`）
+    - **triton**：保留 Triton `tl.dot` 融合 kernel，但 RTX 5090 (sm_120) 编译失败，自动 fallback
+  - 环境变量：`NANOVLLM_GEMM_BACKEND=auto|ref|cuda|triton`，`NANOVLLM_FUSED_MLP=1`
+  - `auto` 在 sm_120 上优先 **cuda**，否则尝试 triton
+  - 新增 `scripts/benchmark_gemm.py`（micro + e2e prefill 对比）、`scripts/run_math500_gemm.sh`；`eval_math500.py` 支持 `--gemm-backends ref,cuda`
+- Why:
+  - Prefill 阶段 MLP `gate_up+SiLU` 在 Python 侧有额外 `split`/激活开销
+  - RTX 5090 上 Triton `tl.dot` 因 `AccelerateMatmul` 不支持 sm_120 无法编译；改用原生 CUDA 绕过
+  - GEMM 本身仍走 cuBLAS（不重复造轮子），仅融合 epilogue
+- Impact:
+  - **Micro gate_up+SiLU**（Qwen2.5-3B shape，RTX 5090，单次调用 vs ref）：
+
+    | N tokens | ref (μs) | cuda (μs) | speedup |
+    |---:|---:|---:|---:|
+    | 512 | 314 | 304 | 1.03× |
+    | 2048 | 1002 | 942 | 1.06× |
+    | 4096 | 1919 | 1798 | 1.07× |
+    | 8192 | 3728 | 3496 | 1.07× |
+
+    36 层 MLP 估算（N=2048）：ref 36.0 ms → cuda 33.9 ms（约 **-2.1 ms/step**）
+
+  - **MATH-500 50 题**（RTX 5090 + Qwen2.5-3B-Instruct，`max_tokens=512, batch_size=16`）  
+    `eval_math500.py` 现分别统计 **prefill / decode** 耗时与吞吐（不再把端到端 tok/s 误标为 decode）：
+
+    | backend | 准确率 | 总耗时 | prefill | decode |
+    |---|---:|---:|---|---|
+    | ref | **54.0%** (27/50) | 58.4 s | 1.0 s, **5595 tok/s** (5806 tok) | 57.3 s, 367 tok/s (21004 tok) |
+    | cuda | **54.0%** (27/50) | 49.1 s | 0.2 s, **25693 tok/s** (5806 tok) | 48.8 s, 448 tok/s (21863 tok) |
+
+    cuda vs ref：**准确率持平**；总耗时 **-16%**；**prefill 约 4.6×**（5806 prompt tok 相同）；decode 路径未改，decode 吞吐差异含生成长度不同与首轮 ref 冷启动影响，不宜单独归因于 MLP 优化
+
+  - E2E prefill micro（稳态，prompt≈2k）：约 **+2~3%**（Attention 占主导，MLP 优化被稀释）
+- Validation:
+
+```bash
+# 依赖：pip install ninja；CUDA 扩展首次 JIT ~10–20s
+export TORCH_CUDA_ARCH_LIST=12.0   # 可选，加快 5090 编译
+
+# Micro + e2e prefill 对比
+python scripts/benchmark_gemm.py /root/autodl-tmp/Qwen2.5-3B-Instruct
+
+# MATH-500 ref vs cuda（50 题）
+bash scripts/run_math500_gemm.sh
+
+# 或
+python scripts/eval_math500.py /root/autodl-tmp/Qwen2.5-3B-Instruct \
+  --gemm-backends ref,cuda --modes baseline --limit 50 \
+  --out results/math500_gemm_ref_cuda_50.json
+```
+
+- Notes:
+  - Triton 融合 GEMM 在 sm_120 上报 `computeCapability not supported`；`torch.compile` epilogue 路径 bf16 数值不稳定（max diff≈16），已弃用
+  - CUDA kernel 与 ref 在 MATH-500 上 **27/50 完全一致**；bf16 micro 偶发 max diff≤16，mean diff≈0.015
+  - 完整 MATH-500 结果：`results/math500_gemm_ref_cuda_50.json`
+  - 下一步可选：cuBLASLt 真融合 GEMM+epilogue（省 `[N, 2*inter]` 中间 tensor），或 Triton 3.5+ sm_120 patch 后启用 triton backend
+
+### Prefill MLP 融合数据流
+
+```
+Prefill 每层 MLP（Qwen2.5-3B）
+  hidden [N, 2048]
+       │
+       ├─ ref:  F.linear → [N, 22016] → split → silu(gate)*up → [N, 11008]
+       │
+       └─ cuda: F.linear (cuBLAS) → [N, 22016] ──→ silu_mul_kernel → [N, 11008]
+                                                    (CUDA, 5090 OK)
+       │
+       └─ down_proj → [N, 2048]
+```
+
+---
+
+## [2026-05-22] SnapKV KV Cache 压缩 + MATH-500 端到端评测（RTX 5090 / Qwen2.5-3B）
+
+- Scope: `compress_utils`, `CompressMethod`, `attention`, `model_runner`, `scheduler`, `block_manager`, `eval_math500.py`
+- Change:
+  - Decode-only KV 压缩：每层 Attention 在 `store_kvcache` 之后、`flash_attn_with_kvcache` 之前调用 `kv_cache_compress()`
+  - 默认算法 **SnapKV**：用最近 `window` 个 query 对历史 key 打分，保留 BOS + top-k 重要 key + tail window
+  - 两种触发模式（`model_runner.prepare_decode`）：
+    - **一次性模式**（`kv_compress_period=0`）：当 `context_len == block_size * (N+1) - 1` 时触发（默认 `N=1` → 511 tokens）
+    - **周期模式**（`kv_compress_period>0`）：每新增 `period` tokens 触发一次，保留 `ratio * period` tokens（blog repro：`period=1024, ratio=0.5`）
+  - 压缩完成后末层上报 `compression_events` → `Scheduler.postprocess` 更新 `num_tokens` / `kv_compress_anchor` / `block_manager.truncate_blocks` 释放尾部 block
+  - 开启 `kv_compress` 时默认关闭 prefix cache（`kv_compress_no_prefix_cache=True`）
+- Why: 长上下文 decode 时降低 KV 显存占用，提高可并发序列数；SnapKV 在几乎不增算力的前提下做 token 级筛选
+- Impact:
+  - **RTX 5090 + Qwen2.5-3B-Instruct，MATH-500 50 题**（`max_tokens=512, batch_size=16, period=0`）：
+
+    | 模式 | 准确率 | 耗时 | decode 吞吐 | compress_events |
+    |---|---:|---:|---:|---:|
+    | baseline | **56.0%** (28/50) | 57.4 s | 372.8 tok/s | 0 |
+    | compress | 48.0% (24/50) | 55.5 s | 389.9 tok/s | 0 |
+
+  - 默认 `period=0` 且 `max_tokens=512` 时，多数数学题未命中 `context_len=511` 触发点，压缩几乎未生效（吞吐 +5%，准确率 -8 pp 可能来自采样随机性）
+  - **Qwen3-0.6B，MATH-500 50 题，周期压缩**（`period=1024, ratio=0.5`，历史结果 `results/math500_repro50.json`）：
+
+    | 模式 | 准确率 | 耗时 | decode 吞吐 | compress_events |
+    |---|---:|---:|---:|---:|
+    | baseline | 26.0% (13/50) | 41.5 s | 1207.9 tok/s | 0 |
+    | compress | 28.0% (14/50) | 42.6 s | 1182.7 tok/s | **46** |
+
+  - 周期模式下压缩稳定触发，准确率基本持平，吞吐略降 ~2%
+- Validation:
+
+```bash
+# 正确性 smoke（短输出，kv_compress_n=1 应与 baseline token 一致）
+python scripts/validate_kv_compress.py ~/huggingface/Qwen3-0.6B/
+
+# MATH-500 50 题（Qwen2.5-3B）
+bash scripts/run_math500_qwen25_3b.sh \
+  --limit 50 --modes baseline,compress --out results/math500_qwen25_50.json
+
+# blog 周期压缩 repro
+python scripts/eval_math500.py ~/huggingface/Qwen3-0.6B/ --repro-blog
+```
+
+- Notes:
+  - `rope_pos` 保持逻辑位置连续；物理 KV 长度 `context_lens` 在压缩后缩短
+  - `enforce_eager=True` 为压缩路径强制要求（禁用 CUDA graph）
+  - 完整结果见 `results/math500_qwen25_50.json`
+
+### KV Cache 压缩流程
+
+```mermaid
+flowchart TB
+    subgraph Engine["LLMEngine._step (decode)"]
+        A[Scheduler.schedule] --> B[ModelRunner.prepare_decode]
+        B --> C{kv_compress?}
+        C -->|否| D[set_context 常规 decode]
+        C -->|是| E[扫描 batch：选出 compress_selected]
+        E --> F{触发模式}
+        F -->|period=0| G["trigger: context_len == B*(N+1)-1"]
+        F -->|period>0| H["trigger: clen-anchor >= period"]
+        G --> I[set_context + compress_selected + base_context_lens]
+        H --> I
+    end
+
+    subgraph Layer["Attention.forward (每层 decode)"]
+        I --> J[store_kvcache_kernel 写入新 token KV]
+        J --> K{compress_selected 非空?}
+        K -->|否| M[flash_attn_with_kvcache]
+        K -->|是| L[kv_cache_compress → compress_compact]
+        L --> L1[gather 最近 window_blocks 的 KV slots]
+        L1 --> L2[SnapKV: Q×K 打分 → top-k keep_idx]
+        L2 --> L3[compact_kv_cache: src→dst 原地搬移 K/V]
+        L3 --> L4[更新 context_lens]
+        L4 --> M
+    end
+
+    subgraph Post["末层完成后"]
+        M --> N[采样 next token]
+        N --> O{layer_id == 最后一层?}
+        O -->|是| P[记录 compression_events: keep_blocks, freed_block_ids]
+        P --> Q[Scheduler.postprocess]
+        Q --> R[seq.num_tokens ← new_context_len]
+        Q --> S[seq.kv_compress_anchor ← anchor]
+        Q --> T[block_manager.truncate_blocks 释放尾部 block]
+        O -->|否| U[下一层继续]
+    end
+```
+
+**数据流（单次 compress_compact）**：
+
+```
+KV 物理布局 (block_table → slot)
+┌──────────┬─────────────────────────────┬──────────┐
+│ BOS/前缀  │   待压缩 window (N+1 blocks) │ tail 块  │
+└──────────┴─────────────────────────────┴──────────┘
+                    │
+         gather_kv_by_slots (按 slot 取出 K/V)
+                    ▼
+              SnapKV(Q_recent, K_window)
+         保留: [BOS] + top-k keys + [tail window]
+                    ▼
+         compact_kv_cache (index_select + index_copy_)
+                    ▼
+    context_len 缩短；末层 truncate_blocks 回收空闲 block
+```
+
+**SnapKV 选 token 逻辑**（`CompressMethod.SnapKV`）：
+
+1. 取 `K[:, :, :-window, :]` 作为候选历史 key
+2. 用最近 `window` 个 query 计算 attention score → softmax → 对 query 维求和得 key 重要性
+3. `topk(num_keep)` 选出重要 key（强制保留 index 0 = BOS）
+4. 拼接 `[BOS, top-k indices, tail window indices]` 作为保留 slot
+
+---
+
 ## [2026-05-17] CPU Prefill / GPU Decode 分离（pd_separation）
 
 ### Phase 1 — 控制面与状态机

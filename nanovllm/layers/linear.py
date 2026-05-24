@@ -3,6 +3,8 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from nanovllm.ops.gemm import linear_gemm
+
 
 def divide(numerator, denominator):
     assert numerator % denominator == 0
@@ -48,7 +50,7 @@ class ReplicatedLinear(LinearBase):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return linear_gemm(x, self.weight, self.bias)
 
 
 class ColumnParallelLinear(LinearBase):
@@ -70,7 +72,7 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return linear_gemm(x, self.weight, self.bias)
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
@@ -150,7 +152,7 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        y = linear_gemm(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             dist.all_reduce(y)
         return y

@@ -106,11 +106,28 @@ def build_prompts(rows: list[dict], tokenizer) -> list[str]:
     return prompts
 
 
+def reset_gemm_backend(gemm_backend: str | None) -> None:
+    if gemm_backend is None:
+        return
+    os.environ["NANOVLLM_GEMM_BACKEND"] = gemm_backend
+    os.environ["NANOVLLM_FUSED_MLP"] = "1"
+    import nanovllm.ops.gemm as gemm_mod
+
+    gemm_mod._CUDA_AVAILABLE = None
+    if gemm_backend == "cuda":
+        from nanovllm.ops.cuda import load_fused_mlp_extension
+
+        load_fused_mlp_extension.cache_clear()
+        load_fused_mlp_extension()
+        gemm_mod._CUDA_AVAILABLE = True
+
+
 def run_eval(
     model_path: str,
     data_path: str,
     *,
     kv_compress: bool,
+    gemm_backend: str | None = None,
     limit: int | None,
     offset: int,
     max_tokens: int,
@@ -121,6 +138,7 @@ def run_eval(
     batch_size: int,
     max_num_seqs: int,
 ) -> dict:
+    reset_gemm_backend(gemm_backend)
     rows = load_math500(data_path, limit, offset)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
@@ -140,12 +158,27 @@ def run_eval(
     correct = 0
     results = []
     outputs = []
+    timing = {
+        "prefill_s": 0.0,
+        "decode_s": 0.0,
+        "prefill_tokens": 0,
+        "decode_tokens": 0,
+        "prefill_steps": 0,
+        "decode_steps": 0,
+    }
     t0 = time.perf_counter()
     for start in range(0, len(rows), batch_size):
         chunk = rows[start : start + batch_size]
         prompts = build_prompts(chunk, tokenizer)
         chunk_out = llm.generate(prompts, sp, use_tqdm=len(rows) <= batch_size)
         outputs.extend(chunk_out)
+        st = getattr(llm, "last_generate_stats", None) or {}
+        timing["prefill_s"] += st.get("prefill_s", 0.0)
+        timing["decode_s"] += st.get("decode_s", 0.0)
+        timing["prefill_tokens"] += st.get("prefill_tokens", 0)
+        timing["decode_tokens"] += st.get("decode_tokens", 0)
+        timing["prefill_steps"] += st.get("prefill_steps", 0)
+        timing["decode_steps"] += st.get("decode_steps", 0)
     elapsed = time.perf_counter() - t0
     compress_events = llm.compress_step_count if kv_compress else 0
     llm.exit()
@@ -167,16 +200,28 @@ def run_eval(
     torch.cuda.empty_cache()
 
     n = len(rows)
+    output_tokens = sum(len(o["token_ids"]) for o in outputs)
+    prefill_tok_s = timing["prefill_tokens"] / timing["prefill_s"] if timing["prefill_s"] > 0 else 0.0
+    decode_tok_s = timing["decode_tokens"] / timing["decode_s"] if timing["decode_s"] > 0 else 0.0
 
     return {
         "kv_compress": kv_compress,
+        "gemm_backend": gemm_backend or os.environ.get("NANOVLLM_GEMM_BACKEND", "auto"),
         "kv_compress_period": kv_compress_period,
         "kv_compress_ratio": kv_compress_ratio,
         "n": n,
         "correct": correct,
         "accuracy": correct / n if n else 0.0,
         "elapsed_s": elapsed,
-        "tok_per_s": sum(len(o["token_ids"]) for o in outputs) / elapsed if elapsed > 0 else 0,
+        "prefill_s": timing["prefill_s"],
+        "decode_s": timing["decode_s"],
+        "prefill_tokens": timing["prefill_tokens"],
+        "decode_tokens": timing["decode_tokens"],
+        "prefill_steps": timing["prefill_steps"],
+        "decode_steps": timing["decode_steps"],
+        "prefill_tok_s": prefill_tok_s,
+        "decode_tok_s": decode_tok_s,
+        "tok_per_s": output_tokens / elapsed if elapsed > 0 else 0,
         "compress_events": compress_events,
         "results": results,
     }
@@ -197,6 +242,11 @@ def main():
     parser.add_argument("--max-num-seqs", type=int, default=0, help="scheduler cap, 0=auto")
     parser.add_argument("--repro-blog", action="store_true", help="period=1024 ratio=0.5 max_tokens=1024 limit=500")
     parser.add_argument("--modes", default="baseline,compress", help="baseline,compress")
+    parser.add_argument(
+        "--gemm-backends",
+        default="",
+        help="compare GEMM backends on MATH-500, e.g. ref,cuda (empty = use env/default)",
+    )
     parser.add_argument("--out", default=None, help="json report path")
     args = parser.parse_args()
 
@@ -218,6 +268,7 @@ def main():
 
     limit = None if args.limit == 0 else args.limit
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    gemm_backends = [b.strip() for b in args.gemm_backends.split(",") if b.strip()] or [None]
     reports = {}
 
     max_num_seqs = args.max_num_seqs or min(args.batch_size, 512)
@@ -228,39 +279,90 @@ def main():
         f"max_tokens={args.max_tokens} batch_size={args.batch_size} "
         f"max_num_seqs={max_num_seqs} period={args.kv_compress_period} ratio={args.kv_compress_ratio}"
     )
+    if gemm_backends != [None]:
+        print(f"gemm_backends={gemm_backends}")
 
     for mode in modes:
         kv = mode == "compress"
         if mode not in ("baseline", "compress"):
             print(f"skip unknown mode: {mode}")
             continue
-        print(f"\n=== {mode} ===")
-        rep = run_eval(
-            model_path,
-            args.data,
-            kv_compress=kv,
-            limit=limit,
-            offset=args.offset,
-            max_tokens=args.max_tokens,
-            temperature=args.temperature,
-            kv_compress_n=args.kv_compress_n,
-            kv_compress_period=args.kv_compress_period if kv else 0,
-            kv_compress_ratio=args.kv_compress_ratio,
-            batch_size=args.batch_size,
-            max_num_seqs=max_num_seqs,
-        )
-        reports[mode] = rep
-        print(
-            f"accuracy: {rep['correct']}/{rep['n']} = {rep['accuracy']:.2%}  "
-            f"time: {rep['elapsed_s']:.1f}s  decode: {rep['tok_per_s']:.1f} tok/s  "
-            f"compress_events: {rep.get('compress_events', 0)}"
-        )
+        for gemm_backend in gemm_backends:
+            label = mode if gemm_backend is None else f"{mode}/{gemm_backend}"
+            print(f"\n=== {label} ===")
+            rep = run_eval(
+                model_path,
+                args.data,
+                kv_compress=kv,
+                gemm_backend=gemm_backend,
+                limit=limit,
+                offset=args.offset,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                kv_compress_n=args.kv_compress_n,
+                kv_compress_period=args.kv_compress_period if kv else 0,
+                kv_compress_ratio=args.kv_compress_ratio,
+                batch_size=args.batch_size,
+                max_num_seqs=max_num_seqs,
+            )
+            reports[label] = rep
+            print(
+                f"accuracy: {rep['correct']}/{rep['n']} = {rep['accuracy']:.2%}  "
+                f"total: {rep['elapsed_s']:.1f}s  "
+                f"prefill: {rep['prefill_s']:.1f}s ({rep['prefill_tok_s']:.0f} tok/s, {rep['prefill_tokens']} tok)  "
+                f"decode: {rep['decode_s']:.1f}s ({rep['decode_tok_s']:.0f} tok/s, {rep['decode_tokens']} tok)  "
+                f"compress_events: {rep.get('compress_events', 0)}  "
+                f"gemm_backend: {rep.get('gemm_backend', 'auto')}"
+            )
 
     if "baseline" in reports and "compress" in reports:
         b, c = reports["baseline"], reports["compress"]
-        print("\n=== compare ===")
+        print("\n=== compare (baseline vs compress) ===")
         print(f"accuracy  baseline {b['accuracy']:.2%}  compress {c['accuracy']:.2%}  delta {(c['accuracy']-b['accuracy'])*100:+.2f} pp")
-        print(f"throughput baseline {b['tok_per_s']:.1f}  compress {c['tok_per_s']:.1f}  ratio {c['tok_per_s']/b['tok_per_s']:.2f}x")
+        print(
+            f"prefill    baseline {b['prefill_tok_s']:.1f} tok/s  compress {c['prefill_tok_s']:.1f} tok/s  "
+            f"ratio {c['prefill_tok_s']/b['prefill_tok_s']:.2f}x"
+        )
+        print(
+            f"decode     baseline {b['decode_tok_s']:.1f} tok/s  compress {c['decode_tok_s']:.1f} tok/s  "
+            f"ratio {c['decode_tok_s']/b['decode_tok_s']:.2f}x"
+        )
+        print(
+            f"e2e        baseline {b['tok_per_s']:.1f} tok/s  compress {c['tok_per_s']:.1f} tok/s  "
+            f"ratio {c['tok_per_s']/b['tok_per_s']:.2f}x"
+        )
+
+    if gemm_backends != [None]:
+        print("\n=== compare (GEMM backends on MATH-500) ===")
+        for mode in ("baseline", "compress"):
+            if mode not in modes:
+                continue
+            pairs = [(g, reports.get(f"{mode}/{g}")) for g in gemm_backends if reports.get(f"{mode}/{g}")]
+            if len(pairs) >= 2:
+                ref_key = next((k for k in gemm_backends if k == "ref"), gemm_backends[0])
+                cuda_key = next((k for k in gemm_backends if k == "cuda"), gemm_backends[1])
+                r_ref = reports.get(f"{mode}/{ref_key}")
+                r_cuda = reports.get(f"{mode}/{cuda_key}")
+                if r_ref and r_cuda:
+                    print(f"[{mode}] {ref_key} vs {cuda_key}:")
+                    print(
+                        f"  accuracy  {r_ref['accuracy']:.2%} vs {r_cuda['accuracy']:.2%}  "
+                        f"delta {(r_cuda['accuracy']-r_ref['accuracy'])*100:+.2f} pp"
+                    )
+                    print(
+                        f"  prefill   {r_ref['prefill_s']:.1f}s ({r_ref['prefill_tok_s']:.0f} tok/s) vs "
+                        f"{r_cuda['prefill_s']:.1f}s ({r_cuda['prefill_tok_s']:.0f} tok/s)  "
+                        f"speedup {r_ref['prefill_s']/r_cuda['prefill_s']:.3f}x"
+                    )
+                    print(
+                        f"  decode    {r_ref['decode_s']:.1f}s ({r_ref['decode_tok_s']:.0f} tok/s) vs "
+                        f"{r_cuda['decode_s']:.1f}s ({r_cuda['decode_tok_s']:.0f} tok/s)  "
+                        f"speedup {r_ref['decode_s']/r_cuda['decode_s']:.3f}x"
+                    )
+                    print(
+                        f"  total     {r_ref['elapsed_s']:.1f}s vs {r_cuda['elapsed_s']:.1f}s  "
+                        f"speedup {r_ref['elapsed_s']/r_cuda['elapsed_s']:.3f}x"
+                    )
 
     if args.out:
         out_path = Path(args.out)

@@ -15,7 +15,7 @@ from nanovllm.engine.kv_transfer import import_kv_to_gpu
 
 
 def get_model_cls(model_type: str):
-    if model_type == "qwen3":
+    if model_type in ("qwen3", "qwen2"):
         return Qwen3ForCausalLM
     if model_type == "llama":
         return LlamaForCausalLM

@@ -125,13 +125,28 @@ class LLMEngine:
             self.add_request(prompt, sp)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
+        stats = {
+            "prefill_s": 0.0,
+            "decode_s": 0.0,
+            "prefill_tokens": 0,
+            "decode_tokens": 0,
+            "prefill_steps": 0,
+            "decode_steps": 0,
+        }
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()
+            dt = perf_counter() - t
             if num_tokens > 0:
-                prefill_throughput = num_tokens / (perf_counter() - t)
+                prefill_throughput = num_tokens / dt
+                stats["prefill_s"] += dt
+                stats["prefill_tokens"] += num_tokens
+                stats["prefill_steps"] += 1
             else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
+                decode_throughput = -num_tokens / dt
+                stats["decode_s"] += dt
+                stats["decode_tokens"] += -num_tokens
+                stats["decode_steps"] += 1
             pbar.set_postfix({
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
@@ -143,4 +158,5 @@ class LLMEngine:
         pbar.close()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        self.last_generate_stats = stats
         return outputs
